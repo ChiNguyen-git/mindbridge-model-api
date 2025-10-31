@@ -15,6 +15,32 @@ from transformers import DistilBertTokenizer, DistilBertModel
 import numpy as np
 import json
 import os
+import requests
+
+MODEL_DIR = "model"
+MODEL_PATH = os.path.join(MODEL_DIR, "model.pt")
+MODEL_URL = "https://github.com/ChiNguyen-git/mindbridge-model-api/releases/download/v1.0/best_model.pt"
+
+# Ensure model folder exists
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+# Download model if missing
+if not os.path.exists(MODEL_PATH):
+    print("🔽 Downloading model file...")
+    response = requests.get(MODEL_URL)
+    if response.status_code == 200:
+        with open(MODEL_PATH, "wb") as f:
+            f.write(response.content)
+        print("✅ Model downloaded successfully!")
+    else:
+        raise Exception(f"Failed to download model: {response.status_code}")
+
+
+import torch
+
+model = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
+model.eval()
+
 
 app = Flask(__name__)
 CORS(app)
