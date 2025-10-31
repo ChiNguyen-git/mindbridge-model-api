@@ -16,42 +16,61 @@ import numpy as np
 import json
 import os
 import requests
-
-MODEL_DIR = "model"
-MODEL_PATH = os.path.join(MODEL_DIR, "model.pt")
-MODEL_URL = "https://github.com/ChiNguyen-git/mindbridge-model-api/releases/download/v1.0/best_model.pt"
-
-# Ensure model folder exists
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-# Download model if missing
-if not os.path.exists(MODEL_PATH):
-    print("🔽 Downloading model file...")
-    response = requests.get(MODEL_URL)
-    if response.status_code == 200:
-        with open(MODEL_PATH, "wb") as f:
-            f.write(response.content)
-        print("✅ Model downloaded successfully!")
-    else:
-        raise Exception(f"Failed to download model: {response.status_code}")
-
-
-import torch
-
-model = torch.load(MODEL_PATH, map_location=torch.device('cpu'))
-model.eval()
-
+import sys
 
 app = Flask(__name__)
 CORS(app)
 
+# Configuration
+MODEL_DIR = "model"
+MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pt")
+MODEL_URL = "https://github.com/ChiNguyen-git/mindbridge-model-api/releases/download/v1.0/best_model.pt"
+device = torch.device('cpu')
+
+# Ensure model folder exists
+os.makedirs(MODEL_DIR, exist_ok=True)
+
 # Load config
-with open('model/config.json', 'r') as f:
-    CONFIG = json.load(f)
+CONFIG = {
+    "dropout": 0.3,
+    "model_name": "distilbert-base-uncased"
+}
 
-device = torch.device('cpu')  # Railway uses CPU
+# Try to load config if exists
+if os.path.exists('model/config.json'):
+    try:
+        with open('model/config.json', 'r') as f:
+            CONFIG = json.load(f)
+        print("✅ Config loaded")
+    except:
+        print("Using default config")
 
-# Model architecture
+# Download model if missing
+if not os.path.exists(MODEL_PATH):
+    print("🔽 Downloading model file from GitHub Release...")
+    try:
+        response = requests.get(MODEL_URL, stream=True)
+        if response.status_code == 200:
+            # Download in chunks to show progress
+            total_size = int(response.headers.get('content-length', 0))
+            with open(MODEL_PATH, 'wb') as f:
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            percent = (downloaded / total_size) * 100
+                            print(f"Progress: {percent:.1f}%", end='\r')
+            print("\n✅ Model downloaded successfully!")
+        else:
+            print(f"❌ Failed to download model: {response.status_code}")
+            sys.exit(1)  # Exit if can't download model
+    except Exception as e:
+        print(f"❌ Error downloading model: {e}")
+        sys.exit(1)  # Exit if download fails
+
+# Define Model Architecture
 class DepressionPTSDModel(nn.Module):
     def __init__(self, dropout=0.3):
         super(DepressionPTSDModel, self).__init__()
@@ -67,13 +86,56 @@ class DepressionPTSDModel(nn.Module):
         logits = self.classifier(pooled_output)
         return self.sigmoid(logits)
 
-# Load model
-print("Loading model...")
-model = DepressionPTSDModel(dropout=CONFIG['dropout'])
-model.load_state_dict(torch.load('model/best_model.pt', map_location=device))
-model.eval()
+# Load Model (REQUIRED - will exit if fails)
+print("📦 Loading model architecture...")
+try:
+    # Step 1: Create model instance
+    model = DepressionPTSDModel(dropout=CONFIG.get('dropout', 0.3))
 
-tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+    print("📦 Loading model weights from:", MODEL_PATH)
+    # Step 2: Load the state dict (weights only)
+    checkpoint = torch.load(MODEL_PATH, map_location=device)
+
+    # Handle different checkpoint formats
+    if isinstance(checkpoint, dict):
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+    else:
+        # It's already a state_dict (OrderedDict)
+        state_dict = checkpoint
+
+    # Step 3: Load weights into model
+    model.load_state_dict(state_dict, strict=False)
+
+    # Step 4: Set to evaluation mode
+    model.eval()
+    print("✅ Model loaded successfully!")
+
+except Exception as e:
+    print(f"❌ CRITICAL: Failed to load model: {e}")
+    print("Cannot start server without model")
+    sys.exit(1)  # Exit - model is required
+
+# Load tokenizer
+print("📦 Loading tokenizer...")
+try:
+    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+    print("✅ Tokenizer loaded!")
+except Exception as e:
+    print(f"❌ CRITICAL: Failed to load tokenizer: {e}")
+    sys.exit(1)
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        'status': 'healthy',
+        'model': 'DistilBERT Depression/PTSD Detector',
+        'model_loaded': True
+    })
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -81,45 +143,54 @@ def analyze():
         data = request.json
         text = data.get('transcript', '')
 
-        # Tokenize
-        inputs = tokenizer(text, return_tensors='pt', truncation=True,
-                          padding=True, max_length=512)
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
 
-        # Predict
+        # Tokenize
+        inputs = tokenizer(
+            text,
+            return_tensors='pt',
+            truncation=True,
+            padding=True,
+            max_length=512
+        )
+
+        # Predict with real model
         with torch.no_grad():
             outputs = model(inputs['input_ids'], inputs['attention_mask'])
-            probs = outputs.numpy()[0]
+            probs = outputs.cpu().numpy()[0]
 
         depression_prob = float(probs[0])
         ptsd_prob = float(probs[1])
 
         # Determine levels using chatbot tiers
-        dep_level = 'minimal'
-        if depression_prob >= 0.74:
-            dep_level = 'moderate'
-        elif depression_prob >= 0.93:
+        if depression_prob >= 0.93:
             dep_level = 'severe'
+        elif depression_prob >= 0.74:
+            dep_level = 'moderate'
         elif depression_prob >= 0.4:
             dep_level = 'low'
+        else:
+            dep_level = 'minimal'
 
-        # Convert to PHQ-8 (for n8n compatibility)
-        phq8 = int(depression_prob * 24)
+        # Convert to PHQ-8
+        phq8 = min(int(depression_prob * 24), 24)
 
         return jsonify({
             'depression_probability': depression_prob,
             'depression_level': dep_level,
             'ptsd_probability': ptsd_prob,
             'phq8_score': phq8,
-            'needs_intervention': depression_prob > 0.74
+            'needs_intervention': depression_prob > 0.74,
+            'confidence': max(abs(depression_prob - 0.5), abs(ptsd_prob - 0.5)) * 2
         })
 
     except Exception as e:
+        print(f"Error in analyze: {e}")
         return jsonify({'error': str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'healthy'})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    print(f"🚀 Starting server on port {port}")
+    print("📊 Model is ready for predictions")
+    app.run(host='0.0.0.0', port=port, debug=False)
