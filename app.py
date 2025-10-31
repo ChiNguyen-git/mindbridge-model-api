@@ -21,37 +21,81 @@ import sys
 app = Flask(__name__)
 CORS(app)
 
-# Configuration
+# Configuration paths
 MODEL_DIR = "model"
 MODEL_PATH = os.path.join(MODEL_DIR, "best_model.pt")
+THRESHOLDS_PATH = os.path.join(MODEL_DIR, "best_thresholds.npy")
+CONFIG_PATH = os.path.join(MODEL_DIR, "config.json")
+
+# GitHub release URL for large model file
 MODEL_URL = "https://github.com/ChiNguyen-git/mindbridge-model-api/releases/download/v1.0/best_model.pt"
+
+# Device configuration
 device = torch.device('cpu')
 
 # Ensure model folder exists
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Load config
+# Default configuration
 CONFIG = {
     "dropout": 0.3,
-    "model_name": "distilbert-base-uncased"
+    "model_name": "distilbert-base-uncased",
+    "thresholds": {
+        "depression": 0.27,  # actual threshold
+        "ptsd": 0.29         # actual threshold
+    },
+    "tiers": {
+        "chatbot_tiers": {
+            "depression": {
+                "minimal": [0, 0.27],
+                "mild": [0.27, 0.4],
+                "moderate": [0.4, 0.74],
+                "moderate_severe": [0.74, 0.93],
+                "severe": [0.93, 1.0]
+            },
+            "ptsd": {
+                "minimal": [0, 0.29],
+                "mild": [0.29, 0.54],
+                "moderate": [0.54, 0.86],
+                "severe": [0.86, 1.0]
+            }
+        }
+    }
 }
 
-# Try to load config if exists
-if os.path.exists('model/config.json'):
+# Load config.json if exists
+if os.path.exists(CONFIG_PATH):
     try:
-        with open('model/config.json', 'r') as f:
-            CONFIG = json.load(f)
-        print("✅ Config loaded")
-    except:
-        print("Using default config")
+        with open(CONFIG_PATH, 'r') as f:
+            loaded_config = json.load(f)
+            CONFIG.update(loaded_config)
+        print("✅ Config loaded from file")
+    except Exception as e:
+        print(f"⚠️ Using default config: {e}")
+
+# Load thresholds from .npy file if exists
+if os.path.exists(THRESHOLDS_PATH):
+    try:
+        thresholds = np.load(THRESHOLDS_PATH, allow_pickle=True)
+        if isinstance(thresholds, np.ndarray) and len(thresholds) >= 2:
+            CONFIG['thresholds']['depression'] = float(thresholds[0])
+            CONFIG['thresholds']['ptsd'] = float(thresholds[1])
+            print(f"✅ Loaded thresholds from file - Depression: {CONFIG['thresholds']['depression']:.3f}, PTSD: {CONFIG['thresholds']['ptsd']:.3f}")
+        elif isinstance(thresholds, dict):
+            CONFIG['thresholds'].update(thresholds)
+            print(f"✅ Loaded thresholds from dict")
+    except Exception as e:
+        print(f"⚠️ Using default thresholds: {e}")
+else:
+    print(f"ℹ️ Using hardcoded thresholds - Depression: {CONFIG['thresholds']['depression']}, PTSD: {CONFIG['thresholds']['ptsd']}")
 
 # Download model if missing
 if not os.path.exists(MODEL_PATH):
     print("🔽 Downloading model file from GitHub Release...")
+    print(f"   URL: {MODEL_URL}")
     try:
         response = requests.get(MODEL_URL, stream=True)
         if response.status_code == 200:
-            # Download in chunks to show progress
             total_size = int(response.headers.get('content-length', 0))
             with open(MODEL_PATH, 'wb') as f:
                 downloaded = 0
@@ -61,14 +105,16 @@ if not os.path.exists(MODEL_PATH):
                         downloaded += len(chunk)
                         if total_size > 0:
                             percent = (downloaded / total_size) * 100
-                            print(f"Progress: {percent:.1f}%", end='\r')
+                            print(f"   Progress: {percent:.1f}%", end='\r')
             print("\n✅ Model downloaded successfully!")
         else:
-            print(f"❌ Failed to download model: {response.status_code}")
-            sys.exit(1)  # Exit if can't download model
+            print(f"❌ Failed to download model: HTTP {response.status_code}")
+            sys.exit(1)
     except Exception as e:
         print(f"❌ Error downloading model: {e}")
-        sys.exit(1)  # Exit if download fails
+        sys.exit(1)
+else:
+    print("✅ Model file found locally")
 
 # Define Model Architecture
 class DepressionPTSDModel(nn.Module):
@@ -81,19 +127,19 @@ class DepressionPTSDModel(nn.Module):
 
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.last_hidden_state[:, 0]
+        pooled_output = outputs.last_hidden_state[:, 0]  # [CLS] token
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
         return self.sigmoid(logits)
 
-# Load Model (REQUIRED - will exit if fails)
+# Load Model (REQUIRED - exits if fails)
 print("📦 Loading model architecture...")
 try:
-    # Step 1: Create model instance
+    # Create model instance
     model = DepressionPTSDModel(dropout=CONFIG.get('dropout', 0.3))
 
-    print("📦 Loading model weights from:", MODEL_PATH)
-    # Step 2: Load the state dict (weights only)
+    print(f"📦 Loading model weights from: {MODEL_PATH}")
+    # Load the checkpoint
     checkpoint = torch.load(MODEL_PATH, map_location=device)
 
     # Handle different checkpoint formats
@@ -108,17 +154,22 @@ try:
         # It's already a state_dict (OrderedDict)
         state_dict = checkpoint
 
-    # Step 3: Load weights into model
+    # Load weights into model
     model.load_state_dict(state_dict, strict=False)
 
-    # Step 4: Set to evaluation mode
+    # Set to evaluation mode
     model.eval()
-    print("✅ Model loaded successfully!")
+
+    # Disable gradient computation
+    for param in model.parameters():
+        param.requires_grad = False
+
+    print("✅ Model loaded and ready!")
 
 except Exception as e:
     print(f"❌ CRITICAL: Failed to load model: {e}")
     print("Cannot start server without model")
-    sys.exit(1)  # Exit - model is required
+    sys.exit(1)
 
 # Load tokenizer
 print("📦 Loading tokenizer...")
@@ -129,24 +180,69 @@ except Exception as e:
     print(f"❌ CRITICAL: Failed to load tokenizer: {e}")
     sys.exit(1)
 
+def get_depression_level(prob, threshold=0.27):
+    """Determine depression severity level based on probability"""
+    if prob < threshold:
+        return 'minimal', 0
+    elif prob < 0.4:
+        return 'mild', 1
+    elif prob < 0.74:
+        return 'moderate', 2
+    elif prob < 0.93:
+        return 'moderate-severe', 3
+    else:
+        return 'severe', 4
+
+def get_ptsd_level(prob, threshold=0.29):
+    """Determine PTSD severity level based on probability"""
+    if prob < threshold:
+        return 'minimal', 0
+    elif prob < 0.54:
+        return 'mild', 1
+    elif prob < 0.86:
+        return 'moderate', 2
+    else:
+        return 'severe', 3
+
+def estimate_phq8_score(depression_prob, depression_positive):
+    """Convert depression probability to estimated PHQ-8 score (0-24)"""
+    if not depression_positive:
+        # Not depressed: 0-4
+        return int(depression_prob * 15)
+    elif depression_prob < 0.4:
+        # Mild: 5-9
+        return 5 + int((depression_prob - 0.27) * 31)
+    elif depression_prob < 0.74:
+        # Moderate: 10-14
+        return 10 + int((depression_prob - 0.4) * 15)
+    elif depression_prob < 0.93:
+        # Moderate-severe: 15-19
+        return 15 + int((depression_prob - 0.74) * 26)
+    else:
+        # Severe: 20-24
+        return 20 + int((depression_prob - 0.93) * 57)
+
 @app.route('/health', methods=['GET'])
 def health():
+    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'model': 'DistilBERT Depression/PTSD Detector',
+        'thresholds': CONFIG['thresholds'],
         'model_loaded': True
     })
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
+    """Main analysis endpoint"""
     try:
         data = request.json
         text = data.get('transcript', '')
 
-        if not text:
+        if not text or not text.strip():
             return jsonify({'error': 'No text provided'}), 400
 
-        # Tokenize
+        # Tokenize input text
         inputs = tokenizer(
             text,
             return_tensors='pt',
@@ -155,42 +251,129 @@ def analyze():
             max_length=512
         )
 
-        # Predict with real model
+        # Get model predictions
         with torch.no_grad():
             outputs = model(inputs['input_ids'], inputs['attention_mask'])
             probs = outputs.cpu().numpy()[0]
 
+        # Extract probabilities
         depression_prob = float(probs[0])
         ptsd_prob = float(probs[1])
 
-        # Determine levels using chatbot tiers
-        if depression_prob >= 0.93:
-            dep_level = 'severe'
-        elif depression_prob >= 0.74:
-            dep_level = 'moderate'
-        elif depression_prob >= 0.4:
-            dep_level = 'low'
-        else:
-            dep_level = 'minimal'
+        # Binary classification based on thresholds
+        depression_threshold = CONFIG['thresholds']['depression']
+        ptsd_threshold = CONFIG['thresholds']['ptsd']
 
-        # Convert to PHQ-8
-        phq8 = min(int(depression_prob * 24), 24)
+        depression_positive = depression_prob >= depression_threshold
+        ptsd_positive = ptsd_prob >= ptsd_threshold
 
-        return jsonify({
+        # Get severity levels
+        depression_level, depression_severity = get_depression_level(depression_prob, depression_threshold)
+        ptsd_level, ptsd_severity = get_ptsd_level(ptsd_prob, ptsd_threshold)
+
+        # Estimate PHQ-8 score
+        phq8_score = estimate_phq8_score(depression_prob, depression_positive)
+        phq8_score = min(max(phq8_score, 0), 24)  # Ensure 0-24 range
+
+        # Determine if intervention needed
+        needs_intervention = (
+            (depression_positive and depression_severity >= 2) or  # Moderate or higher
+            (ptsd_positive and ptsd_severity >= 2)  # Moderate or higher
+        )
+
+        # Calculate confidence (distance from threshold)
+        depression_confidence = abs(depression_prob - depression_threshold)
+        ptsd_confidence = abs(ptsd_prob - ptsd_threshold)
+        overall_confidence = (depression_confidence + ptsd_confidence) / 2
+
+        # Prepare response
+        response = {
+            # Raw probabilities
             'depression_probability': depression_prob,
-            'depression_level': dep_level,
             'ptsd_probability': ptsd_prob,
-            'phq8_score': phq8,
-            'needs_intervention': depression_prob > 0.74,
-            'confidence': max(abs(depression_prob - 0.5), abs(ptsd_prob - 0.5)) * 2
-        })
+
+            # Binary detection
+            'depression_detected': depression_positive,
+            'ptsd_detected': ptsd_positive,
+
+            # Severity levels
+            'depression_level': depression_level,
+            'ptsd_level': ptsd_level,
+
+            # PHQ-8 estimation
+            'phq8_score': phq8_score,
+
+            # Intervention recommendation
+            'needs_intervention': needs_intervention,
+
+            # Confidence metrics
+            'confidence': overall_confidence,
+            'depression_confidence': depression_confidence,
+            'ptsd_confidence': ptsd_confidence,
+
+            # Thresholds used
+            'thresholds_used': {
+                'depression': depression_threshold,
+                'ptsd': ptsd_threshold
+            }
+        }
+
+        return jsonify(response)
 
     except Exception as e:
         print(f"Error in analyze: {e}")
-        return jsonify({'error': str(e)}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'error': str(e),
+            'type': 'analysis_error'
+        }), 500
+
+@app.route('/test', methods=['GET'])
+def test():
+    """Test endpoint with sample texts"""
+    test_cases = [
+        "I feel great and happy today",
+        "I'm a bit stressed about work",
+        "I feel very sad and hopeless, I can't sleep"
+    ]
+
+    results = []
+    for text in test_cases:
+        # Get prediction for each test case
+        inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
+        with torch.no_grad():
+            outputs = model(inputs['input_ids'], inputs['attention_mask'])
+            probs = outputs.cpu().numpy()[0]
+
+        dep_prob = float(probs[0])
+        ptsd_prob = float(probs[1])
+
+        results.append({
+            'text': text[:50],
+            'depression': {
+                'probability': dep_prob,
+                'detected': dep_prob >= CONFIG['thresholds']['depression'],
+                'level': get_depression_level(dep_prob)[0]
+            },
+            'ptsd': {
+                'probability': ptsd_prob,
+                'detected': ptsd_prob >= CONFIG['thresholds']['ptsd'],
+                'level': get_ptsd_level(ptsd_prob)[0]
+            }
+        })
+
+    return jsonify({
+        'thresholds': CONFIG['thresholds'],
+        'test_results': results
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 Starting server on port {port}")
-    print("📊 Model is ready for predictions")
+    print("="*50)
+    print(f"🚀 Starting MindBridge Model API")
+    print(f"📍 Port: {port}")
+    print(f"🎯 Thresholds - Depression: {CONFIG['thresholds']['depression']}, PTSD: {CONFIG['thresholds']['ptsd']}")
+    print(f"✅ Model: Loaded and ready")
+    print("="*50)
     app.run(host='0.0.0.0', port=port, debug=False)
