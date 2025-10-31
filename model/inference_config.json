@@ -1,0 +1,40 @@
+{
+  "model_name": "distilbert-base-uncased",
+  "max_len": 512,
+  "stride": 256,
+  "dropout": 0.3,
+  "thresholds": {
+    "depression": 0.27,
+    "ptsd": 0.29
+  },
+  "paths": {
+    "best_model": "/content/drive/MyDrive/depression_project/DAIC_WOZ/processed/best_model.pt",
+    "thresholds": "/content/drive/MyDrive/depression_project/DAIC_WOZ/processed/best_thresholds.npy"
+  },
+  "tiers": {
+    "chatbot_tiers": {
+      "depression": {
+        "low": 0.4,
+        "moderate": 0.74,
+        "severe": 1.0
+      },
+      "ptsd": {
+        "low": 0.54,
+        "moderate": 0.86,
+        "severe": 1.0
+      }
+    },
+    "safety_tiers": {
+      "depression": {
+        "low": 0.27,
+        "moderate": 0.93,
+        "severe": 1.0
+      },
+      "ptsd": {
+        "low": 0.29,
+        "moderate": 0.94,
+        "severe": 1.0
+      }
+    }
+  }
+}
