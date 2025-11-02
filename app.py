@@ -27,34 +27,25 @@ device = torch.device('cpu')
 # Ensure model folder exists
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# SIMPLIFIED 3-TIER CONFIGURATION
+# Simplified 3-tier configuration
 CONFIG = {
     "dropout": 0.3,
     "model_name": "distilbert-base-uncased",
     "thresholds": {
-        "depression": 0.27,  # Threshold for positive detection
-        "ptsd": 0.29         # Threshold for positive detection
+        "depression": 0.27,
+        "ptsd": 0.29
     },
     "severity_levels": {
-        "depression": {
-            "low": [0, 0.27],
-            "moderate": [0.27, 0.93],
-            "severe": [0.93, 1.0]
-        },
-        "ptsd": {
-            "low": [0, 0.29],
-            "moderate": [0.29, 0.94],
-            "severe": [0.94, 1.0]
-        }
+        "depression": {"low": [0, 0.27], "moderate": [0.27, 0.93], "severe": [0.93, 1.0]},
+        "ptsd": {"low": [0, 0.29], "moderate": [0.29, 0.94], "severe": [0.94, 1.0]}
     }
 }
 
-# Load config.json if exists (but use our simplified tiers)
+# Load config.json if exists (only update dropout and model_name)
 if os.path.exists(CONFIG_PATH):
     try:
         with open(CONFIG_PATH, 'r') as f:
             loaded_config = json.load(f)
-            # Only update dropout and model_name, not tiers
             CONFIG['dropout'] = loaded_config.get('dropout', 0.3)
             CONFIG['model_name'] = loaded_config.get('model_name', 'distilbert-base-uncased')
         print("✅ Config partially loaded from file")
@@ -121,9 +112,7 @@ class DepressionPTSDModel(nn.Module):
 print("📦 Loading model architecture...")
 try:
     model = DepressionPTSDModel(dropout=CONFIG.get('dropout', 0.3))
-    print(f"📦 Loading model weights from: {MODEL_PATH}")
     checkpoint = torch.load(MODEL_PATH, map_location=device)
-    
     if isinstance(checkpoint, dict):
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
@@ -133,17 +122,13 @@ try:
             state_dict = checkpoint
     else:
         state_dict = checkpoint
-    
     model.load_state_dict(state_dict, strict=False)
     model.eval()
-    
     for param in model.parameters():
         param.requires_grad = False
-    
     print("✅ Model loaded and ready!")
 except Exception as e:
     print(f"❌ CRITICAL: Failed to load model: {e}")
-    print("Cannot start server without model")
     sys.exit(1)
 
 # Load tokenizer
@@ -155,9 +140,8 @@ except Exception as e:
     print(f"❌ CRITICAL: Failed to load tokenizer: {e}")
     sys.exit(1)
 
-# SIMPLIFIED 3-TIER FUNCTIONS
+# 3-Tier Level Functions
 def get_depression_level(prob):
-    """Determine depression severity using 3-tier system"""
     if prob < 0.27:
         return 'low', 0
     elif prob < 0.93:
@@ -166,7 +150,6 @@ def get_depression_level(prob):
         return 'severe', 2
 
 def get_ptsd_level(prob):
-    """Determine PTSD severity using 3-tier system"""
     if prob < 0.29:
         return 'low', 0
     elif prob < 0.94:
@@ -174,26 +157,9 @@ def get_ptsd_level(prob):
     else:
         return 'severe', 2
 
-def estimate_phq8_score(depression_prob):
-    """Convert depression probability to estimated PHQ-8 score (0-24)
-    Using 3-tier mapping:
-    - Low (0-0.27): PHQ-8 0-4 (minimal)
-    - Moderate (0.27-0.93): PHQ-8 5-19 (mild to moderately severe)
-    - Severe (0.93-1.0): PHQ-8 20-24 (severe)
-    """
-    if depression_prob < 0.27:
-        # Low: map to 0-4
-        return int(depression_prob / 0.27 * 4)
-    elif depression_prob < 0.93:
-        # Moderate: map to 5-19
-        return 5 + int((depression_prob - 0.27) / (0.93 - 0.27) * 14)
-    else:
-        # Severe: map to 20-24
-        return 20 + int((depression_prob - 0.93) / (1.0 - 0.93) * 4)
-
+# Health check endpoint
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'model': 'DistilBERT Depression/PTSD Detector',
@@ -202,108 +168,47 @@ def health():
         'model_loaded': True
     })
 
+# Simplified analyze endpoint
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """Main analysis endpoint with 3-tier system"""
     try:
         data = request.json
         text = data.get('transcript', '')
-
         if not text or not text.strip():
             return jsonify({'error': 'No text provided'}), 400
 
-        # Tokenize input text
-        inputs = tokenizer(
-            text,
-            return_tensors='pt',
-            truncation=True,
-            padding=True,
-            max_length=512
-        )
-
-        # Get model predictions
+        inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
         with torch.no_grad():
             outputs = model(inputs['input_ids'], inputs['attention_mask'])
             probs = outputs.cpu().numpy()[0]
 
-        # Extract probabilities
         depression_prob = float(probs[0])
         ptsd_prob = float(probs[1])
+        depression_level, _ = get_depression_level(depression_prob)
+        ptsd_level, _ = get_ptsd_level(ptsd_prob)
 
-        # Get severity levels (3-tier)
-        depression_level, depression_severity = get_depression_level(depression_prob)
-        ptsd_level, ptsd_severity = get_ptsd_level(ptsd_prob)
-
-        # Binary detection (positive if moderate or severe)
-        depression_detected = depression_prob >= CONFIG['thresholds']['depression']
-        ptsd_detected = ptsd_prob >= CONFIG['thresholds']['ptsd']
-
-        # Estimate PHQ-8 score
-        phq8_score = estimate_phq8_score(depression_prob)
-        phq8_score = min(max(phq8_score, 0), 24)  # Ensure 0-24 range
-
-        # Determine if intervention needed (moderate or severe needs intervention)
-        needs_intervention = (depression_severity >= 1) or (ptsd_severity >= 1)
-
-        # Calculate confidence
-        depression_confidence = abs(depression_prob - CONFIG['thresholds']['depression'])
-        ptsd_confidence = abs(ptsd_prob - CONFIG['thresholds']['ptsd'])
-        overall_confidence = (depression_confidence + ptsd_confidence) / 2
-
-        # Prepare response
         response = {
-            # Raw probabilities
             'depression_probability': depression_prob,
-            'ptsd_probability': ptsd_prob,
-
-            # Binary detection
-            'depression_detected': depression_detected,
-            'ptsd_detected': ptsd_detected,
-
-            # 3-tier severity levels
             'depression_level': depression_level,
-            'ptsd_level': ptsd_level,
-            
-            # Severity scores (0=low, 1=moderate, 2=severe)
-            'depression_severity': depression_severity,
-            'ptsd_severity': ptsd_severity,
-
-            # PHQ-8 estimation
-            'phq8_score': phq8_score,
-
-            # Intervention recommendation
-            'needs_intervention': needs_intervention,
-
-            # Confidence metrics
-            'confidence': overall_confidence,
-            'depression_confidence': depression_confidence,
-            'ptsd_confidence': ptsd_confidence,
-
-            # Configuration used
-            'thresholds_used': CONFIG['thresholds'],
-            'severity_levels_used': CONFIG['severity_levels']
+            'ptsd_probability': ptsd_prob,
+            'ptsd_level': ptsd_level
         }
-
         return jsonify(response)
 
     except Exception as e:
         print(f"Error in analyze: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            'error': str(e),
-            'type': 'analysis_error'
-        }), 500
+        return jsonify({'error': str(e), 'type': 'analysis_error'}), 500
 
+# Simplified test endpoint
 @app.route('/test', methods=['GET'])
 def test():
-    """Test endpoint with sample texts"""
     test_cases = [
         "I feel great and happy today",
         "I'm a bit stressed about work", 
         "I feel very sad and hopeless, I can't sleep"
     ]
-
     results = []
     for text in test_cases:
         inputs = tokenizer(text, return_tensors='pt', truncation=True, padding=True, max_length=512)
@@ -313,37 +218,20 @@ def test():
 
         dep_prob = float(probs[0])
         ptsd_prob = float(probs[1])
-
         results.append({
             'text': text[:50],
-            'depression': {
-                'probability': dep_prob,
-                'level': get_depression_level(dep_prob)[0],
-                'detected': dep_prob >= CONFIG['thresholds']['depression']
-            },
-            'ptsd': {
-                'probability': ptsd_prob,
-                'level': get_ptsd_level(ptsd_prob)[0],
-                'detected': ptsd_prob >= CONFIG['thresholds']['ptsd']
-            },
-            'phq8_score': estimate_phq8_score(dep_prob)
+            'depression_probability': dep_prob,
+            'depression_level': get_depression_level(dep_prob)[0],
+            'ptsd_probability': ptsd_prob,
+            'ptsd_level': get_ptsd_level(ptsd_prob)[0]
         })
-
-    return jsonify({
-        'thresholds': CONFIG['thresholds'],
-        'severity_levels': CONFIG['severity_levels'],
-        'test_results': results
-    })
+    return jsonify({'test_results': results})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("="*50)
     print(f"🚀 Starting MindBridge Model API (3-Tier System)")
     print(f"📍 Port: {port}")
-    print(f"🎯 Thresholds - Depression: {CONFIG['thresholds']['depression']}, PTSD: {CONFIG['thresholds']['ptsd']}")
-    print(f"📊 Severity Levels:")
-    print(f"   Depression: low < 0.27 | moderate 0.27-0.93 | severe ≥ 0.93")
-    print(f"   PTSD: low < 0.29 | moderate 0.29-0.94 | severe ≥ 0.94")
     print(f"✅ Model: Loaded and ready")
     print("="*50)
     app.run(host='0.0.0.0', port=port, debug=False)
